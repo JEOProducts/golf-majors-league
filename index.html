@@ -347,6 +347,11 @@
         const MISSED_CUT_STROKES = 80;
         const COUNTING_GOLFERS = 4;
 
+        // ESPN API (new — toggle to switch data source)
+        const ESPN_SCOREBOARD = 'https://site.api.espn.com/apis/site/v2/sports/golf/pga/scoreboard';
+        const ESPN_LEADERBOARD_BASE = 'https://site.api.espn.com/apis/site/v2/sports/golf/leaderboard';
+        const USE_ESPN_API = true;
+
         // Team rosters
         const TEAMS = {
             'Jim D': [
@@ -809,6 +814,150 @@
             }
         }
 
+        // ESPN API helpers
+
+        // Derive course par once from the first competitor that has a completed linescore.
+        // Par is constant across all four rounds, so we lock it in here and reuse everywhere.
+        function deriveCoursePar(competitors) {
+            for (const c of competitors) {
+                for (const ls of (c.linescores || [])) {
+                    if (ls.value > 0 && ls.displayValue) {
+                        const rel = ls.displayValue === 'E' ? 0 : parseInt(ls.displayValue);
+                        if (!isNaN(rel)) {
+                            const par = Math.round(ls.value - rel);
+                            if (par >= 68 && par <= 75) return par;
+                        }
+                    }
+                }
+            }
+            return 72; // fallback before any round completes
+        }
+
+        // Map ESPN competition status to the strings processTeamScores() already understands.
+        function espnStatusString(competition) {
+            const status = competition?.status;
+            if (!status) return '';
+            const period = status.period || 1;
+            switch (status.type?.name) {
+                case 'STATUS_FINAL':        return 'Final';
+                case 'STATUS_IN_PROGRESS':  return `Round ${period} - In Progress`;
+                case 'STATUS_END_OF_ROUND': return `Round ${period} - Play Complete`;
+                case 'STATUS_SCHEDULED':    return 'Scheduled';
+                default:                    return status.type?.description || '';
+            }
+        }
+
+        // Normalize one ESPN competitor into the shape getPlayerScore() / isMissedCut() expect.
+        function normalizeESPNPlayer(competitor, currentPeriod) {
+            const statusTypeName = competitor.status?.type?.name || '';
+
+            // Round scores — only include rounds where strokes > 0 (i.e., actually played)
+            const rounds = (competitor.linescores || [])
+                .filter(ls => ls.value > 0)
+                .map(ls => ({
+                    number: String(ls.period),
+                    result: String(Math.round(ls.value))
+                }));
+
+            // today: cut/WD/DQ flags, or current round's relative score for active players
+            let today = '';
+            if (statusTypeName === 'STATUS_CUT') {
+                today = 'CUT';
+            } else if (statusTypeName === 'STATUS_WITHDRAWN') {
+                today = 'WD';
+            } else if (statusTypeName === 'STATUS_DISQUALIFIED' || statusTypeName === 'STATUS_DQ') {
+                today = 'DQ';
+            } else {
+                const currentLs = (competitor.linescores || []).find(ls => ls.period === currentPeriod);
+                today = currentLs?.displayValue || '';
+            }
+
+            // Thru (current hole); 0 or absent means player hasn't teed off yet
+            const thru = competitor.status?.thru;
+            const hole = (thru != null && thru > 0) ? String(thru) : '';
+
+            // Tee time — convert ISO timestamp to ET display string (code below strips AM/PM)
+            let teeTime = '';
+            const rawTeeTime = competitor.status?.teeTime;
+            if (rawTeeTime) {
+                try {
+                    const dt = new Date(rawTeeTime);
+                    teeTime = dt.toLocaleTimeString('en-US', {
+                        hour: 'numeric', minute: '2-digit', hour12: true,
+                        timeZone: 'America/New_York'
+                    });
+                } catch (e) { /* leave empty on parse failure */ }
+            }
+
+            // Cumulative score-to-par; ESPN uses 'E' for even, we normalize to '0'
+            const scoreDisplay = competitor.score?.displayValue || 'E';
+            const scoretopar = scoreDisplay === 'E' ? '0' : scoreDisplay;
+
+            return {
+                name: competitor.athlete?.displayName || '',
+                today,
+                pos: competitor.status?.position?.displayName || '',
+                hole,
+                tee_time: teeTime,
+                scoretopar,
+                total: String(Math.round(competitor.score?.value || 0)),
+                rounds: { round: rounds }
+            };
+        }
+
+        async function fetchESPN() {
+            try {
+                teamsContainer.innerHTML = '<div class="loading">Loading scores...</div>';
+
+                // Step 1: get the active event ID from the scoreboard
+                const sbResp = await fetch(ESPN_SCOREBOARD, { headers: { 'Accept': 'application/json' } });
+                if (!sbResp.ok) throw new Error('Failed to fetch ESPN scoreboard');
+                const sbData = await sbResp.json();
+                const eventId = sbData.events?.[0]?.id;
+                if (!eventId) throw new Error('No active event found on ESPN scoreboard');
+
+                // Step 2: get full leaderboard for that event (richer data than scoreboard)
+                const lbResp = await fetch(`${ESPN_LEADERBOARD_BASE}?event=${eventId}`, {
+                    headers: { 'Accept': 'application/json' }
+                });
+                if (!lbResp.ok) throw new Error('Failed to fetch ESPN leaderboard');
+                const lbData = await lbResp.json();
+
+                const event = lbData.events?.[0];
+                const competition = event?.competitions?.[0];
+                const competitors = competition?.competitors || [];
+
+                if (competitors.length === 0) {
+                    teamsContainer.innerHTML = '<div class="error">Unable to parse tournament data</div>';
+                    return;
+                }
+
+                // Derive par once from the first completed linescore; reuse for all players/rounds
+                const coursePar = deriveCoursePar(competitors);
+                const currentPeriod = competition?.status?.period || 1;
+
+                const tournamentInfo = {
+                    name: event?.name || '',
+                    status: espnStatusString(competition),
+                    par: String(coursePar)
+                };
+
+                const players = competitors.map(c => normalizeESPNPlayer(c, currentPeriod));
+
+                tournamentBanner.innerHTML = '<span class="tournament-name">' + tournamentInfo.name + '</span>' +
+                    '<span class="tournament-status">(' + tournamentInfo.status + ')</span>';
+                tournamentBanner.classList.add('visible');
+
+                teamsData = processTeamScores(players, tournamentInfo);
+                renderTeams(teamsData);
+                updateTimestamp();
+
+            } catch (error) {
+                console.error('ESPN fetch error:', error);
+                teamsContainer.innerHTML = `<div class="error">Error loading scores: ${error.message}</div>`;
+            }
+        }
+
         // Event listeners
         expandAllBtn.addEventListener('click', () => {
             allExpanded = !allExpanded;
@@ -891,7 +1040,7 @@
         });
 
         // Initialize
-        fetchLivescores();
+        USE_ESPN_API ? fetchESPN() : fetchLivescores();
     </script>
 </body>
 </html>
