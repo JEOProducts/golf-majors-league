@@ -61,6 +61,17 @@
             margin-left: 8px;
         }
 
+        .tournament-banner .tournament-par {
+            color: #555;
+            margin-left: 12px;
+        }
+
+        .par-footnote {
+            padding: 8px 16px;
+            font-size: 0.8rem;
+            color: #666;
+        }
+
         .controls-bar {
             display: flex;
             justify-content: space-between;
@@ -339,6 +350,8 @@
     <div class="teams-container" id="teamsContainer">
         <div class="loading">Loading scores...</div>
     </div>
+
+    <div class="par-footnote" id="parFootnote" style="display:none;">* Par is estimated and may be updated once a golfer completes the first round.</div>
 
     <script>
         // Configuration
@@ -801,7 +814,8 @@
 
                 // Update tournament banner with actual tournament info
                 tournamentBanner.innerHTML = '<span class="tournament-name">' + tournamentInfo.name + '</span>' +
-                    '<span class="tournament-status">(' + tournamentInfo.status + ')</span>';
+                    '<span class="tournament-status">(' + tournamentInfo.status + ')</span>' +
+                    '<span class="tournament-par">Par ' + tournamentInfo.par + '</span>';
                 tournamentBanner.classList.add('visible');
 
                 teamsData = processTeamScores(players, tournamentInfo);
@@ -818,6 +832,7 @@
 
         // Derive course par once from the first competitor that has a completed linescore.
         // Par is constant across all four rounds, so we lock it in here and reuse everywhere.
+        // Returns {par, confirmed} — confirmed is false when falling back to 72 before any round completes.
         function deriveCoursePar(competitors) {
             for (const c of competitors) {
                 for (const ls of (c.linescores || [])) {
@@ -825,12 +840,12 @@
                         const rel = ls.displayValue === 'E' ? 0 : parseInt(ls.displayValue);
                         if (!isNaN(rel)) {
                             const par = Math.round(ls.value - rel);
-                            if (par >= 68 && par <= 75) return par;
+                            if (par >= 68 && par <= 75) return { par, confirmed: true };
                         }
                     }
                 }
             }
-            return 72; // fallback before any round completes
+            return { par: 72, confirmed: false }; // fallback before any round completes
         }
 
         // Map ESPN competition status to the strings processTeamScores() already understands.
@@ -933,19 +948,23 @@
                 }
 
                 // Derive par once from the first completed linescore; reuse for all players/rounds
-                const coursePar = deriveCoursePar(competitors);
+                const { par: courseParValue, confirmed: parConfirmed } = deriveCoursePar(competitors);
                 const currentPeriod = competition?.status?.period || 1;
 
                 const tournamentInfo = {
                     name: event?.name || '',
                     status: espnStatusString(competition),
-                    par: String(coursePar)
+                    par: String(courseParValue)
                 };
 
                 const players = competitors.map(c => normalizeESPNPlayer(c, currentPeriod));
 
+                const parDisplay = parConfirmed ? 'Par ' + tournamentInfo.par : 'Par ' + tournamentInfo.par + '*';
                 tournamentBanner.innerHTML = '<span class="tournament-name">' + tournamentInfo.name + '</span>' +
-                    '<span class="tournament-status">(' + tournamentInfo.status + ')</span>';
+                    '<span class="tournament-status">(' + tournamentInfo.status + ')</span>' +
+                    '<span class="tournament-par">' + parDisplay + '</span>';
+
+                document.getElementById('parFootnote').style.display = parConfirmed ? 'none' : '';
                 tournamentBanner.classList.add('visible');
 
                 teamsData = processTeamScores(players, tournamentInfo);
